@@ -2,6 +2,9 @@
 
 :zap: fast, typo-resistant, fuzzy LSP auto-completion plugin for Neovim.
 
+> [!WARNING]  
+> This is me open sourcing my hacky completion plugin. I don't know how it will work for others. However, it has been my daily drivers for a few months.
+
 **My goals were:**
 
 - instantaneous (requesting early, caching completions, filtering cached completions)
@@ -17,6 +20,7 @@
 - typo's: when you make a mistake the completion menu never disappears
 
 **Requires Neovim nightly** (I think? not tested on release versions)
+
 
 > [!NOTE]  
 > zap.nvim is heavily inspired by [`epo.nvim`](https://github.com/nvimdev/epo.nvim), but has evolved into a fast and typo-resistant completion plugin. It supports multiple LSPs per buffer. However, it currently does not support snippets or provide additional info.
