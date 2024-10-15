@@ -18,9 +18,9 @@ https://github.com/user-attachments/assets/63e070ba-b1e2-4051-8356-53a565eac14d
  
 **Smaller niceties:**
 
-- pum_width  is *minimum* and *maximum* width.
 - fuzzy: `tlf` would rank `this_long_function` highly.
 - typo's: when you make a mistake the completion menu never disappears
+- pum_width  is *minimum* and *maximum* width.
 
 **Requires Neovim nightly** (I think? not tested on release versions)
 
