@@ -49,9 +49,48 @@ local capabilities = vim.tbl_deep_extend(
     )
 ```
 
+If the completion menu appears dull, ensure your colorscheme includes these highlights:
+
+```
+Pmenu
+PmenuExtra
+PmenuSel
+PmenuKind
+PmenuKindSel
+PmenuExtraSel
+PmenuSbar
+PmenuThumb
+```
+
+### <kbd>TAB</kbd> for completion cycling:
+
+```lua
+vim.keymap.set('i', '<TAB>', function()
+  if vim.fn.pumvisible() == 1 then
+    return '<C-n>'
+  elseif vim.snippet and vim.snippet.jumpable(1) then
+    return '<cmd>lua vim.snippet.jump(1)<cr>'
+  else
+    return '<TAB>'
+  end
+end, { expr = true })
+
+vim.keymap.set('i', '<S-TAB>', function()
+  if vim.fn.pumvisible() == 1 then
+    return '<C-p>'
+  elseif vim.snippet and vim.snippet.jumpable(-1) then
+    return '<cmd>lua vim.snippet.jump(-1)<CR>'
+  else
+    return '<S-TAB>'
+  end
+end, { expr = true })
+
+```
+
+
 ### Python-Specific Configuration
 
-Here's an example setup for Python, using `pyright` and optionally integrating with `jedi`:
+Here's an example setup for Python, using `pyright` and optionally integrating with `jedi`. This config formats auto-import completions and moves them under at least two normal completion items:
 
 ```lua
 -- Python-specific configuration with zap.nvim setup functions
@@ -102,61 +141,8 @@ zap.setup({
         return entries
     end,
 })
-
--- LSP setup for pyright and (optionally) jedi
-local lspconfig = require('lspconfig')
-lspconfig.pyright.setup {
-    capabilities = capabilities,
-    on_attach = function(client, bufnr)
-        -- ... Additional buffer or client-specific settings
-    end,
-}
-
-lspconfig.jedi_language_server.setup({
-    capabilities = capabilities,
-    on_attach = function(client, bufnr)
-        -- ... Additional buffer or client-specific settings
-    end,
-})
 ```
 
-If the completion menu appears dull, ensure your colorscheme includes these highlights:
-
-```
-Pmenu
-PmenuExtra
-PmenuSel
-PmenuKind
-PmenuKindSel
-PmenuExtraSel
-PmenuSbar
-PmenuThumb
-```
-
-### <kbd>TAB</kbd> for completion cycling:
-
-```lua
-vim.keymap.set('i', '<TAB>', function()
-  if vim.fn.pumvisible() == 1 then
-    return '<C-n>'
-  elseif vim.snippet and vim.snippet.jumpable(1) then
-    return '<cmd>lua vim.snippet.jump(1)<cr>'
-  else
-    return '<TAB>'
-  end
-end, { expr = true })
-
-vim.keymap.set('i', '<S-TAB>', function()
-  if vim.fn.pumvisible() == 1 then
-    return '<C-p>'
-  elseif vim.snippet and vim.snippet.jumpable(-1) then
-    return '<cmd>lua vim.snippet.jump(-1)<CR>'
-  else
-    return '<S-TAB>'
-  end
-end, { expr = true })
-
-```
 
 ## License
 
