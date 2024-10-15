@@ -4,7 +4,8 @@
 
 **Requires Neovim nightly**
 
-**Note: zap.nvim is (heavily) inspired by `epo.nvim`, but has evolved into a fast and typo-resistant completion plugin. It supports multiple LSPs per buffer. However, it currently does not support snippets or provide additional info.**
+> [!NOTE]  
+> zap.nvim is heavily inspired by [`epo.nvim`](https://github.com/nvimdev/epo.nvim), but has evolved into a fast and typo-resistant completion plugin. It supports multiple LSPs per buffer. However, it currently does not support snippets or provide additional info.
 
 ## Usage
 
