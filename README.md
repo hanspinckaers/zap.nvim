@@ -2,8 +2,7 @@
 
 :zap: fast, typo-resistant, fuzzy LSP auto-completion plugin for Neovim.
 
-
-https://github.com/user-attachments/assets/b86e6ec9-8209-4661-bda4-7d27104d5259
+https://github.com/user-attachments/assets/63e070ba-b1e2-4051-8356-53a565eac14d
 
 
 > [!WARNING]  
