@@ -12,7 +12,7 @@ https://github.com/user-attachments/assets/63e070ba-b1e2-4051-8356-53a565eac14d
 
 - instantaneous (requesting early, caching completions, filtering cached completions)
 - support for multiple LSPs
-- no flickering (known bug: while refactoring for this plugin a small regression was noticed after typing a 'dot')
+- no flicker
 - limited amount of features to improve hackability (for me)
   - if you want to add snippet support or documentation viewing, that's fine! Please send a PR 😊
  
