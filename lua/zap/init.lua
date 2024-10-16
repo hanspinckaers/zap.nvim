@@ -97,19 +97,26 @@ local function calc_match_score(filter_text, prefix, cursor_pos, buffer_lines)
         end
     end
 
-    -- Calculate match score by comparing filter_text with the prefix character by character
-    local filter_copy = filter_text  -- Copy filter_text since we’ll reduce it as we match chars
+    -- Track which characters in the prefix have been matched
+    local matched_indices = {}
     for i = 1, #prefix do
-        local char = prefix:sub(i, i)
-        local char_pos = filter_copy:find(char, 1, true)
-        if char_pos then
-            if char_pos == i then
-                score = score + 2  -- Add more points for exact positional matches
-            else
-                score = score + 1  -- Add fewer points for loose matches
+        matched_indices[i] = false  -- Initialize all indices as unmatched
+    end
+    -- Calculate match score without modifying filter_text
+    for i = 1, #filter_text do
+        local filter_char = filter_text:sub(i, i)
+        for j = 1, #prefix do
+            local prefix_char = prefix:sub(j, j)
+
+            if filter_char == prefix_char and not matched_indices[j] then
+                if i == j then
+                    score = score + 10  -- Exact positional match
+                else
+                    score = score + 5  -- Loose match
+                end
+                matched_indices[j] = true  -- Mark this character in prefix as matched
+                break  -- Move to the next character in filter_text
             end
-            -- Remove the matched character to prevent double counting
-            filter_copy = filter_copy:sub(1, char_pos - 1) .. filter_copy:sub(char_pos + 1)
         end
     end
 
@@ -136,7 +143,7 @@ local function calc_match_score(filter_text, prefix, cursor_pos, buffer_lines)
 
     -- We don't care for small matches
     if #filter_text < 4 then
-        score = score - 25
+        score = score - 10
     end
 
     -- Scoring for Consecutive Character Matches at the Start
@@ -171,8 +178,8 @@ local function calc_match_score(filter_text, prefix, cursor_pos, buffer_lines)
 
     if closest_distance <= line_range then
         -- The closer the match to the cursor, the higher the score
-        proximity_bonus = 1.01 ^ (line_range - closest_distance) / 10  -- Exponential decay of score
-        score = score * (1 + proximity_bonus)
+        proximity_bonus = 1.05 ^ (line_range - closest_distance)  -- Exponential decay of score
+        score = score + proximity_bonus
     end
 
     -- Return the calculated match score
@@ -298,6 +305,8 @@ local function show_cache(args)
 
     -- Validate that we can extract prefix and start index from the current input
     local ok, retval = pcall(vim.fn.matchstrpos, before_text, '\\k*$')
+    local prefix, start_idx = retval[1], retval[2]
+
     if not ok or not retval or #retval == 0 then
         context[bufnr].cache = {}
         if (mode == 'i' or mode == 'ic') then
@@ -307,7 +316,6 @@ local function show_cache(args)
     end
 
     -- Avoid redundant cache retrieval by checking if the prefix/start index matches previous values
-    local prefix, start_idx = retval[1], retval[2]
     if context[bufnr].last_prefix == prefix and context[bufnr].last_start_idx == start_idx then
         return
     end
@@ -448,7 +456,6 @@ local function completion_handler(_, result, ctx)
     if not result or not api.nvim_buf_is_valid(ctx.bufnr) then
         return
     end
-
     -- Handle both individual and categorized completion item lists provided by the LSP server
     local compitems = vim.islist(result) and result or result.items
     context[ctx.bufnr].incomplete[ctx.client_id] = not vim.islist(result) and result.isIncomplete or false
@@ -463,6 +470,12 @@ local function completion_handler(_, result, ctx)
         return
     end
     local prefix, start_idx = unpack(retval)
+
+    -- Check if the prefix and start index match the expected context
+    if start_idx ~= ctx.start_idx then
+        return
+    end
+
     context[ctx.bufnr].startidx = start_idx
     local startcol = start_idx + 1
 
@@ -532,56 +545,66 @@ local debounce_timers = {}
 -- Function: Debounce the LSP completion process to reduce resource usage.
 -- Limits how often completion requests are made during rapid typing.
 local function debounce(client, bufnr)
-    -- Obtain the current prefix and start index
+    -- Obtain the current column and line where the cursor is positioned
     local col = vfn.charcol('.')
     local line = api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
+
+    -- Extract the prefix and start index initially
     local ok, retval = pcall(vfn.matchstrpos, before_text, '\\k*$')
     if not ok or not retval or #retval == 0 then
         return
     end
-    local prefix = retval[1]:lower()
+    local initial_prefix, initial_start_idx = retval[1], retval[2]
 
-    -- Send immediate request if the prefix is just one character (no debounce)
-    if #prefix <= 1 then
+    if #initial_prefix <= 1 then
         local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
-        client.request(ms.textDocument_completion, params, completion_handler, bufnr)
+        client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
+            -- Append the prefix and start_idx to the existing context
+            response_ctx.prefix = initial_prefix
+            response_ctx.start_idx = initial_start_idx
+            
+            -- Call the completion_handler with the modified context
+            completion_handler(err, result, response_ctx)
+        end, bufnr)
         return
     end
 
-    -- For longer prefixes, apply debounce logic
+    -- Debounce logic for longer prefixes
     if not debounce_timers[bufnr] then
         debounce_timers[bufnr] = {}
     end
 
-    -- Close any existing timer for this client if active
-    local client_id = client.id
-    local client_timer = debounce_timers[bufnr][client_id]
-    if client_timer then
-        if not client_timer:is_closing() then
-            client_timer:stop()
-            client_timer:close()
-        end
-        debounce_timers[bufnr][client_id] = nil
+    -- Close any existing timer for the current client if active
+    local timer = debounce_timers[bufnr][client.id]
+    if timer then
+        timer:stop()
+        timer:close()
+        debounce_timers[bufnr][client.id] = nil
     end
 
-    -- Create and start a new debounce timer for this client
-    local timer = uv.new_timer()
-    debounce_timers[bufnr][client_id] = timer
+    -- Start a new debounce timer for this client
+    timer = uv.new_timer()
+    debounce_timers[bufnr][client.id] = timer
     timer:start(debounce_time, 0, vim.schedule_wrap(function()
-        -- Send the completion request only after the debounce time has elapsed
         local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
-        client.request(ms.textDocument_completion, params, completion_handler, bufnr)
+        client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
+            -- Append the prefix and start_idx to the existing context
+            response_ctx.prefix = initial_prefix
+            response_ctx.start_idx = initial_start_idx
 
-        -- Clean up the timer after request is sent
+            -- Call the completion_handler with the modified context
+            completion_handler(err, result, response_ctx)
+        end, bufnr)
+
+        -- Clean up the timer after the request is sent
         if timer and not timer:is_closing() then
             timer:stop()
             timer:close()
-            debounce_timers[bufnr][client_id] = nil
+            debounce_timers[bufnr][client.id] = nil
         end
     end))
 end
-
 -- Function: Handles LSP-driven autocompletion during typing, triggered by specific events.
 -- Registers relevant autocommands to handle completion dynamically during typing.
 local function auto_complete(client, bufnr)
