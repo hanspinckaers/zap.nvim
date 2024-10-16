@@ -2,6 +2,9 @@
 
 :zap: fast, typo-resistant, fuzzy LSP auto-completion plugin for Neovim.
 
+https://github.com/user-attachments/assets/63e070ba-b1e2-4051-8356-53a565eac14d
+
+
 > [!WARNING]  
 > This is me open sourcing my hacky completion plugin. I don't know how it will work for others. However, it has been my daily drivers for a few months.
 
@@ -9,15 +12,15 @@
 
 - instantaneous (requesting early, caching completions, filtering cached completions)
 - support for multiple LSPs
-- no flickering
+- no flickering (known bug: while refactoring for this plugin a small regression was noticed after typing a 'dot')
 - limited amount of features to improve hackability (for me)
   - if you want to add snippet support or documentation viewing, that's fine! Please send a PR 😊
  
 **Smaller niceties:**
 
-- pum_width  is *minimum* and *maximum* width.
 - fuzzy: `tlf` would rank `this_long_function` highly.
 - typo's: when you make a mistake the completion menu never disappears
+- pum_width  is *minimum* and *maximum* width.
 
 **Requires Neovim nightly** (I think? not tested on release versions)
 
