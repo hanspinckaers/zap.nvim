@@ -17,6 +17,7 @@ local kind_format = nil
 local context = {
     last_prefix = nil,
     last_start_idx = nil,
+    client_ids = {}, -- Store multiple client IDs
 }
 
 local additional_format_completion = function(entry) return entry end
@@ -29,9 +30,10 @@ local function context_init(bufnr, id)
     context[bufnr] = {
         incomplete = {},  -- Incomplete state tracking per client
         timer = nil,      -- Timer for debounce purposes
-        client_id = id,   -- LSP client ID
+        client_ids = {},  -- List of LSP client IDs
         cache = {},       -- Cached completion items
     }
+    table.insert(context[bufnr].client_ids, id) -- Add the new client ID
 end
 
 local function split(input_str, sep)
@@ -423,7 +425,7 @@ local function complete_ondone(bufnr)
                 return
             end
 
-            local client = lsp.get_clients({ id = context[args.buf].client_id })[1]
+            local client = lsp.get_clients({ id = context[args.buf].client_ids[0] })[1]
             if not client then
                 return
             end
@@ -443,12 +445,7 @@ end
 -- Function: Main completion handler to process LSP completion results.
 -- Handles caching, filtering, sorting, and invoking Neovim's native completion system.
 local function completion_handler(_, result, ctx)
-    -- Cleanup any active timers that may overlap
-    if compete_timer and compete_timer:is_active() and not compete_timer:is_closing() then
-        compete_timer:close()
-    end
-    local client = lsp.get_clients({ id = ctx.client_id })
-    if not result or not client or not api.nvim_buf_is_valid(ctx.bufnr) then
+    if not result or not api.nvim_buf_is_valid(ctx.bufnr) then
         return
     end
 
@@ -594,17 +591,23 @@ local function auto_complete(client, bufnr)
             return
         end
 
-        -- Initialize the buffer's context if not already initialized
-        if not context[args.buf] then
-            context_init(args.buf, client.id)
-        end
-
         -- Show cached completions if any are available
-        show_cache(args)
+        local first_client = context[args.buf].client_ids[1]
+        if client.id == first_client then
+            show_cache(args)
+        end
 
         -- Request completion from LSP client with a debounce cycle
         debounce(client, args.buf)
     end
+
+    -- Initialize the buffer's context if not already initialized
+    if not context[bufnr] then
+        context_init(bufnr, client.id)
+    else
+        table.insert(context[bufnr].client_ids, client.id) -- Add the new client ID
+    end
+
 
     -- Register autocommands to trigger completions upon relevant events
     vim.api.nvim_create_autocmd('TextChangedI', {
