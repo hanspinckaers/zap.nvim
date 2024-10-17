@@ -28,7 +28,6 @@ local additional_sorting_handler = function(entries) return entries end
 -- Handles the state saved by the module for each buffer.
 local function context_init(bufnr, id)
     context[bufnr] = {
-        incomplete = {},  -- Incomplete state tracking per client
         timer = nil,      -- Timer for debounce purposes
         client_ids = {},  -- List of LSP client IDs
         cache = {},       -- Cached completion items
@@ -192,10 +191,26 @@ local function sort_entries(entries, prefix)
     local cursor_pos = vim.api.nvim_win_get_cursor(0)
     local buffer_lines = vim.api.nvim_buf_get_lines(0, 0, -1, true)
 
+    local score_cache = {}
+
     -- Sort entries based on custom scoring criteria
     table.sort(entries, function(a, b)
-        local filter_a_score = calc_match_score(a.word or a.filterText or "", prefix, cursor_pos, buffer_lines)
-        local filter_b_score = calc_match_score(b.word or b.filterText or "", prefix, cursor_pos, buffer_lines)
+        -- Use a unique key for each entry for caching
+        local key_a = a.word or a.filterText or ""
+        local key_b = b.word or b.filterText or ""
+
+        -- Check cache for scores
+        local filter_a_score = score_cache[key_a]
+        if not filter_a_score then
+            filter_a_score = calc_match_score(key_a, prefix, cursor_pos, buffer_lines)
+            score_cache[key_a] = filter_a_score -- Cache the score
+        end
+
+        local filter_b_score = score_cache[key_b]
+        if not filter_b_score then
+            filter_b_score = calc_match_score(key_b, prefix, cursor_pos, buffer_lines)
+            score_cache[key_b] = filter_b_score -- Cache the score
+        end
 
         -- Adjust scores using user-provided additional_score_handler
         filter_a_score = additional_score_handler(filter_a_score, a)
@@ -288,24 +303,14 @@ local function show_cache(args)
         return
     end
 
+
     -- Get the current state of the line and word before the cursor
     local col = vim.fn.charcol('.')
     local line = vim.api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
 
-    -- Check if the last character before the cursor is a dot, if so delete the cache
-    if before_text:sub(-1) == '.' then
-        -- Clear the cache and hide the completion menu
-        context[bufnr].cache = {}
-        if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- Ensure the complete menu is hidden after clearing cache
-        end
-        return
-    end
-
     -- Validate that we can extract prefix and start index from the current input
     local ok, retval = pcall(vim.fn.matchstrpos, before_text, '\\k*$')
-    local prefix, start_idx = retval[1], retval[2]
 
     if not ok or not retval or #retval == 0 then
         context[bufnr].cache = {}
@@ -313,6 +318,15 @@ local function show_cache(args)
             vim.fn.complete(1, {})  -- Ensure the complete menu is hidden after clearing cache
         end
         return  -- Exit gracefully if there's an error in matching the string
+    end
+
+    local prefix, start_idx = retval[1], retval[2]
+    if context[bufnr].last_start_idx ~= start_idx then
+        context[bufnr].cache = {}
+        if (mode == 'i' or mode == 'ic') then
+            vim.fn.complete(1, {})  -- Ensure the complete menu is hidden after clearing cache
+        end
+        return
     end
 
     -- Avoid redundant cache retrieval by checking if the prefix/start index matches previous values
@@ -458,8 +472,6 @@ local function completion_handler(_, result, ctx)
     end
     -- Handle both individual and categorized completion item lists provided by the LSP server
     local compitems = vim.islist(result) and result or result.items
-    context[ctx.bufnr].incomplete[ctx.client_id] = not vim.islist(result) and result.isIncomplete or false
-
     local col = vfn.charcol('.')
     local line = api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
@@ -476,13 +488,10 @@ local function completion_handler(_, result, ctx)
         return
     end
 
-    context[ctx.bufnr].startidx = start_idx
-    local startcol = start_idx + 1
-
     -- Track unique entries to avoid duplicates
     local entry_set = {}
 
-    if context[ctx.bufnr].cache and context[ctx.bufnr].last_prefix == prefix then
+    if context[ctx.bufnr].cache and context[ctx.bufnr].last_start_idx == start_idx then
         -- Initialize entry set with current in-cache entries
         for idx, entry in ipairs(context[ctx.bufnr].cache) do
             local menu = entry.menu or ''
@@ -491,6 +500,8 @@ local function completion_handler(_, result, ctx)
     else
         context[ctx.bufnr].cache = {}
     end
+
+    context[ctx.bufnr].last_start_idx = start_idx
 
     -- Process and insert fresh items while removing duplicates
     for _, item in ipairs(compitems) do
@@ -526,11 +537,13 @@ local function completion_handler(_, result, ctx)
 
     -- Schedule completion after a small delay (debounce)
     local mode = api.nvim_get_mode()['mode']  -- Re-check mode when the timer executes
+
     -- Only call completion within insert or completion mode
     if mode == 'i' or mode == 'ic' then
         local has_dot = before_text:sub(-1) == '.'
         if #prefix > 0 or has_dot then
             if vim.fn.complete_info({ 'selected' }).selected == -1 then
+                local startcol = start_idx + 1
                 vfn.complete(startcol, valid_entries)  -- Trigger autocompletion popup
                 complete_ondone(ctx.bufnr)
             end
