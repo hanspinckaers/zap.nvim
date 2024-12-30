@@ -698,11 +698,11 @@ local function debounce(client, bufnr)
     local client_cache = context[bufnr] and context[bufnr].clients[client.id]
     local cache_empty = not client_cache or #(client_cache.cache or {}) == 0
 
-    if not cache_empty and client_cache.context_changed then
-        log("Adjusting position character to start_idx")
-        params.position.character = initial_start_idx
-        client_state.request_another = true
-    end
+    -- if not cache_empty and client_cache.context_changed then
+    --     log("Adjusting position character to start_idx")
+    --     params.position.character = initial_start_idx
+    --     client_state.request_another = true
+    -- end
 
     client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
         response_ctx.prefix = initial_prefix
