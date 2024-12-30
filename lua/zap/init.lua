@@ -1,4 +1,3 @@
--- Lua-based Neovim LSP configuration for autocompletion setup
 -- Import necessary modules and functions
 local api, vfn, uv, lsp = vim.api, vim.fn, vim.uv, vim.lsp
 local protocol = require('vim.lsp.protocol')
@@ -6,33 +5,62 @@ local util = require('vim.lsp.util')
 local ms = protocol.Methods
 
 -- Create a unique highlight namespace and user-defined augroup
-local zap_augroup = api.nvim_create_augroup('Zap', { clear = true })  -- User-defined autocommand group
+local zap_augroup = api.nvim_create_augroup('Zap', { clear = true })
 
 -- Configuration defaults and variables
-local debounce_time = 2
 local pum_width = 33
 local kind_format = nil
+local debug_mode = false  -- Enable debug logging
 
 -- State to prevent auto-completion redisplay and save cache
-local context = {
-    last_prefix = nil,
-    last_start_idx = nil,
-    client_ids = {}, -- Store multiple client IDs
-}
+local context = {}
+local request_state = {}
 
 local additional_format_completion = function(entry) return entry end
 local additional_score_handler = function(score, entry) return score end
 local additional_sorting_handler = function(entries) return entries end
 
--- Function: Initialize buffer-specific context.
--- Handles the state saved by the module for each buffer.
+-- Logging function
+local function log(...)
+    if debug_mode then
+        local args = {...}
+        local msg = ""
+        for i, arg in ipairs(args) do
+            if type(arg) == "table" then
+                msg = msg .. vim.inspect(arg)
+            else
+                msg = msg .. tostring(arg)
+            end
+            if i < #args then msg = msg .. " " end
+        end
+        print(string.format("[LSP Completion] %s", msg))
+    end
+end
+
+-- Function: Initialize buffer-specific context
 local function context_init(bufnr, id)
-    context[bufnr] = {
-        timer = nil,      -- Timer for debounce purposes
-        client_ids = {},  -- List of LSP client IDs
-        cache = {},       -- Cached completion items
+    log(string.format("Initializing context for buffer %d, client %d", bufnr, id))
+
+    if not context[bufnr] then
+        context[bufnr] = {
+            clients = {},  -- Store client-specific data
+            client_ids = {},  -- List of LSP client IDs
+        }
+    end
+
+    -- Initialize per-client state
+    context[bufnr].clients[id] = {
+        timer = nil,
+        cache = {},
+        last_line = nil,
+        last_prefix = nil,
+        last_start_idx = nil,
+        context_changed = false,
     }
-    table.insert(context[bufnr].client_ids, id) -- Add the new client ID
+
+    table.insert(context[bufnr].client_ids, id)
+    log(string.format("Context initialized for buffer %d, client %d. Total clients: %d",
+        bufnr, id, #context[bufnr].client_ids))
 end
 
 local function split(input_str, sep)
@@ -41,6 +69,20 @@ local function split(input_str, sep)
         table.insert(result, str)
     end
     return result
+end
+
+-- Function to clear all client caches
+local function clear_all_client_caches(bufnr)
+    if not context[bufnr] then return end
+    log(string.format("Clearing all client caches for buffer %d", bufnr))
+
+    for client_id, client_state in pairs(context[bufnr].clients) do
+        client_state.cache = {}
+        client_state.last_line = nil
+        client_state.last_prefix = nil
+        client_state.last_start_idx = nil
+        log(string.format("Cleared cache for client %d", client_id))
+    end
 end
 
 -- Function: Calculate match score for fuzzy matching.
@@ -181,6 +223,11 @@ local function calc_match_score(filter_text, prefix, cursor_pos, buffer_lines)
         score = score + proximity_bonus
     end
 
+    -- python parameter
+    if filter_text:sub(-1) == '=' then
+        score = score + 50
+    end
+
     -- Return the calculated match score
     return score
 end
@@ -238,6 +285,7 @@ local function sort_entries(entries, prefix)
     -- Apply additional sorting handler after sorting is complete
     return additional_sorting_handler(entries)
 end
+
 local function starts_with(text, prefix)
     -- This util function checks if 'text' starts with the given 'prefix'.
     return text:sub(1, #prefix):lower() == prefix:lower()
@@ -288,95 +336,122 @@ local function filter_and_sort_entries(entries, prefix)
     return final_list
 end
 
--- Function: Show currently cached autocompletion items, immediately display cached
--- entries and defer re-sorting for later smoother experience.
--- This function also invalidates previous timers to ensure only the latest deferred sorting is executed.
-local function show_cache(args)
-    local bufnr = args.buf
-    local mode = api.nvim_get_mode()['mode']  -- Re-check mode when the timer executes
-
-    -- Proceed only if a valid cache exists for this buffer
-    if not context[bufnr] or not context[bufnr].cache then
+-- Function: Show completion cache
+local function show_cache(bufnr, force)
+    local mode = api.nvim_get_mode()['mode']
+    if not context[bufnr] then
+        log(string.format("No context for buffer %d", bufnr))
         if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- Hide the completion menu if there's no cache
+            vim.fn.complete(1, {})
         end
         return
     end
 
-
-    -- Get the current state of the line and word before the cursor
+    -- Get current state
+    local cursor_pos = vim.api.nvim_win_get_cursor(0)
+    local current_line = cursor_pos[1]
     local col = vim.fn.charcol('.')
     local line = vim.api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
+    local has_dot = before_text:sub(-1) == '.'
 
-    -- Validate that we can extract prefix and start index from the current input
+    log(string.format("show_cache - line: %d, col: %d, has_dot: %s", current_line, col, has_dot))
+
     local ok, retval = pcall(vim.fn.matchstrpos, before_text, '\\k*$')
-
-    if not ok or not retval or #retval == 0 then
-        context[bufnr].cache = {}
-        if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- Ensure the complete menu is hidden after clearing cache
-        end
-        return  -- Exit gracefully if there's an error in matching the string
-    end
-
     local prefix, start_idx = retval[1], retval[2]
-    if context[bufnr].last_start_idx ~= start_idx then
-        context[bufnr].cache = {}
-        if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- Ensure the complete menu is hidden after clearing cache
-        end
-        return
-    end
 
-    -- Avoid redundant cache retrieval by checking if the prefix/start index matches previous values
-    if context[bufnr].last_prefix == prefix and context[bufnr].last_start_idx == start_idx then
-        return
-    end
+    -- Check if any client needs to show results or context changed
+    local need_update = force or false  -- Initialize with force value
+    local context_changed = false
+    for client_id, client_state in pairs(context[bufnr].clients) do
+        if client_state.last_prefix ~= prefix or
+           client_state.last_start_idx ~= start_idx or
+           client_state.last_line ~= current_line then
+            need_update = true
+            log(string.format("Client %d needs update - current prefix: %s, last prefix: %s",
+                client_id, prefix, client_state.last_prefix))
 
-    -- Save the latest prefix and starting index
-    context[bufnr].last_prefix = prefix
-    context[bufnr].last_start_idx = start_idx
+            if has_dot then
+                client_state.cache = {}
+            end
 
-    -- Immediate check of whether the prefix is valid (and whether it’s empty)
-    local prefix_word = prefix:gsub("%s+", "")
-    if #prefix_word == 0 then
-        context[bufnr].cache = {}
-        if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- Hide the completion menu when there's no prefix (empty cache)
-        end
-        return
-    end
-
-    -- Always sort the entries (this operation is slow and should be deferred if possible)
-    local sort_and_display_results = function()
-        local re_filtered_sorted_entries = filter_and_sort_entries(
-            context[bufnr].cache, prefix
-        )
-
-        -- After sorting, attempt to open the completion menu
-        if (mode == 'i' or mode == 'ic') and #re_filtered_sorted_entries > 0 then
-            if vim.fn.complete_info({ 'selected' }).selected == -1 then
-                vim.fn.complete(start_idx + 1, re_filtered_sorted_entries)  -- Show the sorted result
+            -- Context changed if any client has different start_idx, line or prefix
+            if (client_state.last_start_idx and client_state.last_start_idx ~= start_idx) or
+               (client_state.last_line and client_state.last_line ~= current_line) then
+                client_state.context_changed = true
+                log(string.format("Context changed for client %d", client_id))
             end
         end
     end
 
-     -- Check if the completion menu (popup menu) is visible
-    if vim.fn.pumvisible() == 1 then
-        -- Only defer the sorting if the item count is greater than 1000
-        if #context[bufnr].cache > 1000 then
-            -- If there are more than 1000 items and the popup menu is visible, defer sorting
+    if not need_update and vim.fn.pumvisible() == 1 then
+        log("No update needed and popup menu is visible")
+        return
+    end
+
+    -- Aggregate entries from all clients
+    local combined_entries = {}
+    local entry_set = {}  -- To track duplicates
+
+    for client_id, client_state in pairs(context[bufnr].clients) do
+        -- Update client state
+        client_state.last_prefix = prefix
+        client_state.last_start_idx = start_idx
+        client_state.last_line = current_line
+
+        log(string.format("Processing %d entries from client %d", #client_state.cache, client_id))
+
+        -- Add entries from this client's cache
+        for _, entry in ipairs(client_state.cache) do
+            local key = entry.word .. (entry.menu or '') .. (entry.abbr or '')
+            if not entry_set[key] then
+                entry.client_id = client_id
+                table.insert(combined_entries, entry)
+                entry_set[key] = true
+            elseif entry_set[key] then
+                -- If entry already exists, keep the one with higher score
+                for i, existing in ipairs(combined_entries) do
+                    if existing.word .. (existing.menu or '') .. (existing.abbr or '') == key then
+                        if (entry.score or 0) > (existing.score or 0) then
+                            combined_entries[i] = entry
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    log(string.format("Combined %d entries, context_changed: %s", #combined_entries, context_changed))
+
+    -- Sort and display the combined results
+    if #combined_entries > 0 then
+        local sort_and_display_results = function()
+            local sorted_entries = filter_and_sort_entries(combined_entries, prefix)
+
+            if (mode == 'i' or mode == 'ic') and #sorted_entries > 0 then
+                if vim.fn.complete_info({ 'selected' }).selected == -1 then
+                    log(string.format("Displaying %d entries at position %d", #sorted_entries, start_idx + 1))
+                    vim.fn.complete(start_idx + 1, sorted_entries)
+                    complete_ondone(bufnr)
+                end
+            end
+        end
+
+        -- Check if we should defer sorting
+        if vim.fn.pumvisible() == 1 and #combined_entries > 2000 then
+            log("Deferring sort for large result set")
             vim.defer_fn(function()
                 sort_and_display_results()
-            end, 1)  -- Defer sorting by 1 ms (this is to not delay display of characters when typing)
+            end, 1)
         else
-            -- If fewer than 1000 items, process directly
             sort_and_display_results()
         end
     else
-        -- If the popup menu is not visible, sort and show results immediately
-        sort_and_display_results()
+        log("No entries to display")
+        if (mode == 'i' or mode == 'ic') then
+            vim.fn.complete(1, {})
+        end
     end
 end
 
@@ -407,11 +482,16 @@ local function process_completion_item(item)
         },
     }
 
+    -- print(vim.inspect(item))
     -- Handle entry formatting using additional_format_completion
     if item.detail and #item.detail > 0 then
         entry.menu = vim.split(item.detail, "\n", { trimempty = true })[1]
     end
 
+    if item.labelDetails then
+        entry.abbr = item.label .. ' +'.. item.labelDetails.description
+        entry.abbr = vim.fn.strcharpart(entry.abbr .. string.rep(' ', pum_width), 0, pum_width)
+    end
     -- Set the word as before
     local textEdit = vim.tbl_get(item, 'textEdit')
     if textEdit then
@@ -427,16 +507,21 @@ local function process_completion_item(item)
 
     return entry
 end
+-- Keep track of buffers that already have CompleteDone autocmd
+local complete_done_registered = {}
 
--- Function: Handle 'CompleteDone' autocommand behavior upon LSP completion.
--- Tasks include applying additional edits, resolving snippets, and triggering signature help.
-local function complete_ondone(bufnr)
+-- Function: Handle 'CompleteDone' autocommand
+function complete_ondone(bufnr)
+    if complete_done_registered[bufnr] then
+        return
+    end
+
+    complete_done_registered[bufnr] = true
+
     api.nvim_create_autocmd('CompleteDone', {
         group = zap_augroup,
         buffer = bufnr,
-        once = true,
         callback = function(args)
-            -- Retrieve the completed item from VIM's completion environment
             local item = vim.v.completed_item
             if not item or vim.tbl_isempty(item) then
                 return
@@ -452,201 +537,230 @@ local function complete_ondone(bufnr)
                 return
             end
 
-            -- Reset any potential menu and cache issues here
-            context[args.buf].cache = {}
-
-            -- Apply additional text edits if the completion item includes them
             if cp_item.additionalTextEdits then
                 lsp.util.apply_text_edits(cp_item.additionalTextEdits, bufnr, client.offset_encoding)
             end
         end,
     })
+
+    api.nvim_create_autocmd('BufDelete', {
+        group = zap_augroup,
+        buffer = bufnr,
+        callback = function()
+            complete_done_registered[bufnr] = nil
+        end,
+    })
 end
 
-
--- Function: Main completion handler to process LSP completion results.
--- Handles caching, filtering, sorting, and invoking Neovim's native completion system.
+-- Function: Main completion handler
 local function completion_handler(_, result, ctx)
     if not result or not api.nvim_buf_is_valid(ctx.bufnr) then
+        log("LSP Completion: Invalid result or buffer")
         return
     end
-    -- Handle both individual and categorized completion item lists provided by the LSP server
-    local compitems = vim.islist(result) and result or result.items
+
+    -- Ignore if completion item is selected
+    if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ 'selected' }).selected ~= -1 then
+        return
+    end
+
+    -- Get current position
+    local current_line = vim.api.nvim_win_get_cursor(0)[1]
     local col = vfn.charcol('.')
     local line = api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
 
-    -- Capture the current word context and determine start index
+    -- Get current context
     local ok, retval = pcall(vfn.matchstrpos, before_text, '\\k*$')
-    if not ok or not #retval == 0 then
+    if not retval or #retval == 0 then
+        log("Invalid match position")
         return
     end
-    local prefix, start_idx = unpack(retval)
+    local _, current_start_idx = retval[1], retval[2]
 
-    -- Check if the prefix and start index match the expected context
-    if start_idx ~= ctx.start_idx then
+    -- Validate position matches
+    if current_start_idx ~= ctx.start_idx or
+       current_line ~= ctx.line_number then
+        log(string.format("Position mismatch - current: %d, %d; context: %d, %d",
+            current_start_idx, current_line, ctx.start_idx, ctx.line_number))
         return
     end
 
-    -- Track unique entries to avoid duplicates
+    -- Check for stale response
+    local client_state = request_state[ctx.bufnr] and request_state[ctx.bufnr][ctx.client_id]
+    if client_state and (
+        client_state.last_start_idx ~= current_start_idx or
+        client_state.last_line ~= current_line
+    ) then
+        log("Stale response detected")
+        return
+    end
+
+    -- Handle both individual and categorized completion item lists
+    local compitems = vim.islist(result) and result or result.items
+    log(string.format("Processing %d completion items for buffer %d", #compitems, ctx.bufnr))
+    if #compitems == 0 then
+        log("No completion items")
+        return
+    end
+
+    -- Initialize client cache if needed
+    if not context[ctx.bufnr].clients[ctx.client_id] then
+        context_init(ctx.bufnr, ctx.client_id)
+    end
+
+    local client_cache = context[ctx.bufnr].clients[ctx.client_id]
     local entry_set = {}
-
-    if context[ctx.bufnr].cache and context[ctx.bufnr].last_start_idx == start_idx then
-        -- Initialize entry set with current in-cache entries
-        for idx, entry in ipairs(context[ctx.bufnr].cache) do
-            local menu = entry.menu or ''
-            entry_set[entry.word .. menu .. entry.abbr] = idx
-        end
-    else
-        context[ctx.bufnr].cache = {}
+    local force_update = false
+    if client_cache.context_changed then
+        client_cache.cache = {}
+        client_cache.context_changed = false
+        force_update = true
     end
-
-    context[ctx.bufnr].last_start_idx = start_idx
 
     -- Process and insert fresh items while removing duplicates
     for _, item in ipairs(compitems) do
         local entry = process_completion_item(item)
-
         local menu = entry.menu or ''
-        -- Check if we already have this entry in the entry_set
-        if entry_set[entry.word .. menu .. entry.abbr] then
-            local existing_idx = entry_set[entry.word .. menu .. entry.abbr]
-            context[ctx.bufnr].cache[existing_idx] = entry  -- Replace the old entry with the new one
+        local key = entry.word .. menu .. entry.abbr
+        if entry_set[key] then
+            local existing_idx = entry_set[key]
+            client_cache.cache[existing_idx] = entry
         else
-            -- If the entry does not exist, add it to the cache
-            table.insert(context[ctx.bufnr].cache, entry)
-            entry_set[entry.word] = #context[ctx.bufnr].cache  -- Store the index in entry_set
+            table.insert(client_cache.cache, entry)
+            entry_set[key] = #client_cache.cache
         end
     end
 
-    -- Save prefix and start index for future processing
-    context[ctx.bufnr].last_prefix = prefix
-    context[ctx.bufnr].last_start_idx = start_idx
+    log(string.format("Added/updated entries in cache for client %d, total entries: %d",
+        ctx.client_id, #client_cache.cache))
 
-    -- Sort and filter cached items based on the current prefix
-    local valid_entries = filter_and_sort_entries(context[ctx.bufnr].cache, prefix)
-
-    -- If no valid entries, hide the completion
-    if #valid_entries == 0 then
-        local mode = vim.api.nvim_get_mode().mode
-        if (mode == 'i' or mode == 'ic') then
-            vim.fn.complete(1, {})  -- <-- Hide complete menu when no valid entries.
-        end
-        return
-    end
-
-    -- Schedule completion after a small delay (debounce)
-    local mode = api.nvim_get_mode()['mode']  -- Re-check mode when the timer executes
-
-    -- Only call completion within insert or completion mode
-    if mode == 'i' or mode == 'ic' then
-        local has_dot = before_text:sub(-1) == '.'
-        if #prefix > 0 or has_dot then
-            if vim.fn.complete_info({ 'selected' }).selected == -1 then
-                local startcol = start_idx + 1
-                vfn.complete(startcol, valid_entries)  -- Trigger autocompletion popup
-                complete_ondone(ctx.bufnr)
-            end
-        end
-    end
+    -- Show combined cache from all clients
+    show_cache(ctx.bufnr, force_update)
 end
 
-
--- Table to store client-specific debounce timers per buffer
-local debounce_timers = {}
-
--- Function: Debounce the LSP completion process to reduce resource usage.
--- Limits how often completion requests are made during rapid typing.
+-- Function: Debounce completions
 local function debounce(client, bufnr)
-    -- Obtain the current column and line where the cursor is positioned
+    -- Get current position info
     local col = vfn.charcol('.')
     local line = api.nvim_get_current_line()
     local before_text = col == 1 and '' or line:sub(1, col - 1)
+    local current_line = vim.api.nvim_win_get_cursor(0)[1]
+    local has_dot = before_text:sub(-1) == '.'
 
-    -- Extract the prefix and start index initially
+    -- Extract prefix and start index
     local ok, retval = pcall(vfn.matchstrpos, before_text, '\\k*$')
-    if not ok or not retval or #retval == 0 then
+    if not retval or #retval == 0 then
+        log("No retval in debounce")
         return
     end
     local initial_prefix, initial_start_idx = retval[1], retval[2]
 
-    if #initial_prefix <= 1 then
-        local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
-        client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
-            -- Append the prefix and start_idx to the existing context
-            response_ctx.prefix = initial_prefix
-            response_ctx.start_idx = initial_start_idx
-            
-            -- Call the completion_handler with the modified context
-            completion_handler(err, result, response_ctx)
-        end, bufnr)
+    log(string.format("Debounce - Client %d, Prefix: '%s', Start Index: %d, Line: %d",
+        client.id, initial_prefix, initial_start_idx, current_line))
+
+    -- Initialize request state
+    if not request_state[bufnr] then
+        request_state[bufnr] = {}
+    end
+
+    -- In the request_state initialization (in debounce function)
+    if not request_state[bufnr][client.id] then
+        request_state[bufnr][client.id] = {
+            in_progress = false,
+            request_another = false,
+            last_start_idx = nil,
+            last_line = nil,
+            context_changed = false  -- Add this flag
+        }
+    end
+
+    local client_state = request_state[bufnr][client.id]
+
+    -- Skip if request in progress at same position
+    if client_state.in_progress and
+       client_state.last_start_idx == initial_start_idx and
+       client_state.last_line == current_line then
+       client_state.request_another = true
+       log("Request another set")
         return
     end
 
-    -- Debounce logic for longer prefixes
-    if not debounce_timers[bufnr] then
-        debounce_timers[bufnr] = {}
+    -- Update client state
+    client_state.in_progress = true
+    client_state.last_start_idx = initial_start_idx
+    client_state.last_line = current_line
+
+    -- Prepare LSP request
+    local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
+
+    -- Check if we should adjust the position
+    local client_cache = context[bufnr] and context[bufnr].clients[client.id]
+    local cache_empty = not client_cache or #(client_cache.cache or {}) == 0
+
+    if not cache_empty and client_cache.context_changed then
+        log("Adjusting position character to start_idx")
+        params.position.character = initial_start_idx
+        client_state.request_another = true
     end
 
-    -- Close any existing timer for the current client if active
-    local timer = debounce_timers[bufnr][client.id]
-    if timer then
-        timer:stop()
-        timer:close()
-        debounce_timers[bufnr][client.id] = nil
-    end
+    client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
+        response_ctx.prefix = initial_prefix
+        response_ctx.start_idx = initial_start_idx
+        response_ctx.line_number = current_line
+        response_ctx.client_id = client.id
 
-    -- Start a new debounce timer for this client
-    timer = uv.new_timer()
-    debounce_timers[bufnr][client.id] = timer
-    timer:start(debounce_time, 0, vim.schedule_wrap(function()
-        local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
-        client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
-            -- Append the prefix and start_idx to the existing context
-            response_ctx.prefix = initial_prefix
-            response_ctx.start_idx = initial_start_idx
+        client_state.in_progress = false
 
-            -- Call the completion_handler with the modified context
-            completion_handler(err, result, response_ctx)
-        end, bufnr)
+        completion_handler(err, result, response_ctx)
 
-        -- Clean up the timer after the request is sent
-        if timer and not timer:is_closing() then
-            timer:stop()
-            timer:close()
-            debounce_timers[bufnr][client.id] = nil
+        -- client_cache = context[bufnr] and context[bufnr].clients[client.id]
+        -- cache_empty = not client_cache
+        -- if not cache_empty then
+        -- end
+
+        if client_state.request_another then
+            client_state.request_another = false
+            log("Triggering another request")
+            debounce(client, bufnr)
         end
-    end))
+    end, bufnr)
 end
--- Function: Handles LSP-driven autocompletion during typing, triggered by specific events.
--- Registers relevant autocommands to handle completion dynamically during typing.
+
+-- Function: Setup autocompletion
 local function auto_complete(client, bufnr)
     local function trigger_completion(args)
-        -- Inhibit autocompletion if a user has selected a completion item from the popup
         if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ 'selected' }).selected ~= -1 then
             return
         end
 
-        -- Show cached completions if any are available
         local first_client = context[args.buf].client_ids[1]
         if client.id == first_client then
-            show_cache(args)
+            show_cache(args.buf)
         end
 
-        -- Request completion from LSP client with a debounce cycle
         debounce(client, args.buf)
     end
 
-    -- Initialize the buffer's context if not already initialized
     if not context[bufnr] then
         context_init(bufnr, client.id)
     else
-        table.insert(context[bufnr].client_ids, client.id) -- Add the new client ID
+        table.insert(context[bufnr].client_ids, client.id)
     end
 
-
-    -- Register autocommands to trigger completions upon relevant events
     vim.api.nvim_create_autocmd('TextChangedI', {
+        group = zap_augroup,
+        buffer = bufnr,
+        callback = function(args) trigger_completion(args) end,
+    })
+
+    vim.api.nvim_create_autocmd('InsertEnter', {
+        group = zap_augroup,
+        buffer = bufnr,
+        callback = function(args) trigger_completion(args) end,
+    })
+
+    vim.api.nvim_create_autocmd('CursorHold', {
         group = zap_augroup,
         buffer = bufnr,
         callback = function(args) trigger_completion(args) end,
@@ -659,10 +773,7 @@ local function auto_complete(client, bufnr)
     })
 end
 
--- Function: LSP registration capabilities for completions.
--- Sets up support for snippets, resolve support for additional
--- data fields, and other related options.
--- @return Capabilities object for LSP server.
+-- Function: LSP registration capabilities
 local function register_cap()
     return {
         textDocument = {
@@ -686,7 +797,6 @@ local attached_buffers = {}
 local function setup(opt)
     -- Options applied to the module
     pum_width = opt.pum_width or pum_width
-    debounce_time = opt.debounce_time or debounce_time
     kind_format = opt.kind_format or function(k) return k:lower():sub(1, 1) end
 
     -- New options for additional functionality
