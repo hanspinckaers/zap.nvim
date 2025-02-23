@@ -312,15 +312,15 @@ local function filter_and_sort_entries(entries, prefix)
     -- Sort the likely matches (those that start with the prefix)
     -- If no likely matches exist, sort the unlikely matches.
     if #likely_matches > 2 then
-        sort_entries(likely_matches, prefix)
+        likely_matches = sort_entries(likely_matches, prefix)
     else
         -- No likely matches, so we sort the unlikely ones as a fallback
-        sort_entries(unlikely_matches, prefix)
+        unlikely_matches = sort_entries(unlikely_matches, prefix)
     end
 
     -- Append the "unlikely matches" (unordered) after sorting likely matches,
     -- only if there are some likely matches. Otherwise, the `unlikely_matches` are already sorted.
-    if #likely_matches > 0 then
+    if #likely_matches > 0 and #likely_matches < 5 then
         for _, entry in ipairs(unlikely_matches) do
             table.insert(likely_matches, entry)
         end
@@ -432,14 +432,17 @@ local function show_cache(bufnr, force)
             if (mode == 'i' or mode == 'ic') and #sorted_entries > 0 then
                 if vim.fn.complete_info({ 'selected' }).selected == -1 then
                     log(string.format("Displaying %d entries at position %d", #sorted_entries, start_idx + 1))
-                    vim.fn.complete(start_idx + 1, sorted_entries)
-                    complete_ondone(bufnr)
+                    -- Show completions if there's a prefix or if there's a period
+                    if #prefix > 0 or has_dot then
+                        vim.fn.complete(start_idx + 1, sorted_entries)
+                        complete_ondone(bufnr)
+                    end
                 end
             end
         end
 
         -- Check if we should defer sorting
-        if vim.fn.pumvisible() == 1 and #combined_entries > 2000 then
+        if vim.fn.pumvisible() == 1 and #combined_entries > 5000 then
             log("Deferring sort for large result set")
             vim.defer_fn(function()
                 sort_and_display_results()
@@ -552,91 +555,105 @@ function complete_ondone(bufnr)
     })
 end
 
+-- Debounce state for completion handler
+local completion_timer = nil
+local completion_delay = 50 -- 50ms debounce delay
+
 -- Function: Main completion handler
 local function completion_handler(_, result, ctx)
-    if not result or not api.nvim_buf_is_valid(ctx.bufnr) then
-        log("LSP Completion: Invalid result or buffer")
-        return
+    -- Cancel any pending completion timer
+    if completion_timer then
+        completion_timer:stop()
+        completion_timer:close()
     end
 
-    -- Ignore if completion item is selected
-    if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ 'selected' }).selected ~= -1 then
-        return
-    end
-
-    -- Get current position
-    local current_line = vim.api.nvim_win_get_cursor(0)[1]
-    local col = vfn.charcol('.')
-    local line = api.nvim_get_current_line()
-    local before_text = col == 1 and '' or line:sub(1, col - 1)
-
-    -- Get current context
-    local ok, retval = pcall(vfn.matchstrpos, before_text, '\\k*$')
-    if not retval or #retval == 0 then
-        log("Invalid match position")
-        return
-    end
-    local _, current_start_idx = retval[1], retval[2]
-
-    -- Validate position matches
-    if current_start_idx ~= ctx.start_idx or
-       current_line ~= ctx.line_number then
-        log(string.format("Position mismatch - current: %d, %d; context: %d, %d",
-            current_start_idx, current_line, ctx.start_idx, ctx.line_number))
-        return
-    end
-
-    -- Check for stale response
-    local client_state = request_state[ctx.bufnr] and request_state[ctx.bufnr][ctx.client_id]
-    if client_state and (
-        client_state.last_start_idx ~= current_start_idx or
-        client_state.last_line ~= current_line
-    ) then
-        log("Stale response detected")
-        return
-    end
-
-    -- Handle both individual and categorized completion item lists
-    local compitems = vim.islist(result) and result or result.items
-    log(string.format("Processing %d completion items for buffer %d", #compitems, ctx.bufnr))
-    if #compitems == 0 then
-        log("No completion items")
-        return
-    end
-
-    -- Initialize client cache if needed
-    if not context[ctx.bufnr].clients[ctx.client_id] then
-        context_init(ctx.bufnr, ctx.client_id)
-    end
-
-    local client_cache = context[ctx.bufnr].clients[ctx.client_id]
-    local entry_set = {}
-    local force_update = false
-    if client_cache.context_changed then
-        client_cache.cache = {}
-        client_cache.context_changed = false
-        force_update = true
-    end
-
-    -- Process and insert fresh items while removing duplicates
-    for _, item in ipairs(compitems) do
-        local entry = process_completion_item(item)
-        local menu = entry.menu or ''
-        local key = entry.word .. menu .. entry.abbr
-        if entry_set[key] then
-            local existing_idx = entry_set[key]
-            client_cache.cache[existing_idx] = entry
-        else
-            table.insert(client_cache.cache, entry)
-            entry_set[key] = #client_cache.cache
+    -- Create new timer for debounced completion
+    completion_timer = vim.loop.new_timer()
+    completion_timer:start(completion_delay, 0, vim.schedule_wrap(function()
+        if not result or not api.nvim_buf_is_valid(ctx.bufnr) then
+            log("LSP Completion: Invalid result or buffer")
+            return
         end
-    end
 
-    log(string.format("Added/updated entries in cache for client %d, total entries: %d",
-        ctx.client_id, #client_cache.cache))
+        -- Ignore if completion item is selected
+        if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ 'selected' }).selected ~= -1 then
+            return
+        end
 
-    -- Show combined cache from all clients
-    show_cache(ctx.bufnr, force_update)
+        -- Get current position
+        local current_line = vim.api.nvim_win_get_cursor(0)[1]
+        local col = vfn.charcol('.')
+        local line = api.nvim_get_current_line()
+        local before_text = col == 1 and '' or line:sub(1, col - 1)
+
+        -- Get current context
+        local ok, retval = pcall(vfn.matchstrpos, before_text, '\\k*$')
+        if not retval or #retval == 0 then
+            log("Invalid match position")
+            return
+        end
+        local _, current_start_idx = retval[1], retval[2]
+
+        -- Validate position matches
+        if current_start_idx ~= ctx.start_idx or
+        current_line ~= ctx.line_number then
+            log(string.format("Position mismatch - current: %d, %d; context: %d, %d",
+                current_start_idx, current_line, ctx.start_idx, ctx.line_number))
+            return
+        end
+
+        -- Check for stale response
+        local client_state = request_state[ctx.bufnr] and request_state[ctx.bufnr][ctx.client_id]
+        if client_state and (
+            client_state.last_start_idx ~= current_start_idx or
+            client_state.last_line ~= current_line
+        ) then
+            log("Stale response detected")
+            return
+        end
+
+        -- Handle both individual and categorized completion item lists
+        local compitems = vim.islist(result) and result or result.items
+        log(string.format("Processing %d completion items for buffer %d", #compitems, ctx.bufnr))
+        if #compitems == 0 then
+            log("No completion items")
+            return
+        end
+
+        -- Initialize client cache if needed
+        if not context[ctx.bufnr].clients[ctx.client_id] then
+            context_init(ctx.bufnr, ctx.client_id)
+        end
+
+        local client_cache = context[ctx.bufnr].clients[ctx.client_id]
+        local entry_set = {}
+        local force_update = false
+        if client_cache.context_changed then
+            client_cache.cache = {}
+            client_cache.context_changed = false
+            force_update = true
+        end
+
+        -- Process and insert fresh items while removing duplicates
+        for _, item in ipairs(compitems) do
+            local entry = process_completion_item(item)
+            local menu = entry.menu or ''
+            local key = entry.word .. menu .. entry.abbr
+            if entry_set[key] then
+                local existing_idx = entry_set[key]
+                client_cache.cache[existing_idx] = entry
+            else
+                table.insert(client_cache.cache, entry)
+                entry_set[key] = #client_cache.cache
+            end
+        end
+
+        -- log(string.format("Added/updated entries in cache for client %d, total entries: %d",
+            -- ctx.client_id, #client_cache.cache))
+
+        -- Show combined cache from all clients
+        show_cache(ctx.bufnr, force_update)
+    end))
 end
 
 -- Function: Debounce completions
@@ -695,51 +712,82 @@ local function debounce(client, bufnr)
     local params = util.make_position_params(api.nvim_get_current_win(), client.offset_encoding)
 
     -- Check if we should adjust the position
-    local client_cache = context[bufnr] and context[bufnr].clients[client.id]
-    local cache_empty = not client_cache or #(client_cache.cache or {}) == 0
-
+    -- local client_cache = context[bufnr] and context[bufnr].clients[client.id]
+    -- local cache_empty = not client_cache or #(client_cache.cache or {}) == 0
     -- if not cache_empty and client_cache.context_changed then
     --     log("Adjusting position character to start_idx")
     --     params.position.character = initial_start_idx
     --     client_state.request_another = true
     -- end
 
-    client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
-        response_ctx.prefix = initial_prefix
-        response_ctx.start_idx = initial_start_idx
-        response_ctx.line_number = current_line
-        response_ctx.client_id = client.id
+    vim.defer_fn(function()
+        client.request(ms.textDocument_completion, params, function(err, result, response_ctx)
+            response_ctx.prefix = initial_prefix
+            response_ctx.start_idx = initial_start_idx
+            response_ctx.line_number = current_line
+            response_ctx.client_id = client.id
 
-        client_state.in_progress = false
+            client_state.in_progress = false
 
-        completion_handler(err, result, response_ctx)
+            vim.defer_fn(function()
+                completion_handler(err, result, response_ctx)
+            end, 1)
 
-        -- client_cache = context[bufnr] and context[bufnr].clients[client.id]
-        -- cache_empty = not client_cache
-        -- if not cache_empty then
-        -- end
-
-        if client_state.request_another then
-            client_state.request_another = false
-            log("Triggering another request")
-            debounce(client, bufnr)
-        end
-    end, bufnr)
+            if client_state.request_another then
+                client_state.request_another = false
+                log("Triggering another request")
+                debounce(client, bufnr)
+            end
+        end, bufnr)
+    end, 1)
 end
 
 -- Function: Setup autocompletion
 local function auto_complete(client, bufnr)
+    local trigger_timer = nil
+    local trigger_delay = 10 -- 50ms debounce delay
+
     local function trigger_completion(args)
         if vim.fn.pumvisible() == 1 and vim.fn.complete_info({ 'selected' }).selected ~= -1 then
             return
         end
 
-        local first_client = context[args.buf].client_ids[1]
-        if client.id == first_client then
-            show_cache(args.buf)
-        end
+        local is_pum_visible = vim.fn.pumvisible() == 1
 
-        debounce(client, args.buf)
+        -- Only use debouncing when popup menu is visible
+        if is_pum_visible then
+            -- Cancel any pending trigger timer
+            if trigger_timer then
+                trigger_timer:stop()
+                trigger_timer:close()
+                trigger_timer = nil
+            end
+
+            -- Create new timer for debounced trigger
+            trigger_timer = vim.loop.new_timer()
+            trigger_timer:start(trigger_delay, 0, vim.schedule_wrap(function()
+                -- Close the timer
+                if trigger_timer then
+                    trigger_timer:stop()
+                    trigger_timer:close()
+                    trigger_timer = nil
+                end
+
+                local first_client = context[args.buf].client_ids[1]
+                if client.id == first_client then
+                    show_cache(args.buf)
+                end
+
+                debounce(client, args.buf)
+            end))
+        else
+            -- Direct execution when popup menu is not visible
+            local first_client = context[args.buf].client_ids[1]
+            if client.id == first_client then
+                show_cache(args.buf)
+            end
+            debounce(client, args.buf)
+        end
     end
 
     if not context[bufnr] then
